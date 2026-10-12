@@ -19,6 +19,7 @@ function fakeShift(over: Partial<ShiftForZReport>): ShiftForZReport {
     opening_float: 50000,
     closing_counted: 156000,
     expected_cash: 156300,
+    till_id: "00000000-0000-0000-0000-0000000000a1",
     created_at: "2026-07-06T08:00:00Z",
     profiles: { full_name: "Test Cashier" },
     ...over,
@@ -27,13 +28,24 @@ function fakeShift(over: Partial<ShiftForZReport>): ShiftForZReport {
 
 // closed shift: over/short is signed (counted − expected → short = negative)
 {
-  const r = buildZReport(fakeShift({}), { cashSales: 106300, cardSales: 40000, saleCount: 12 });
+  const r = buildZReport(fakeShift({}), {
+    cashSales: 106300,
+    cardSales: 40000,
+    saleCount: 12,
+    drawerEvents: [
+      { event_type: "paid_in", amount: 10000 },
+      { event_type: "paid_out", amount: -2000 },
+      { event_type: "safe_drop", amount: -5000 },
+      { event_type: "cash_refund", amount: -3000 },
+    ],
+  });
   check("expected passthrough", r.expectedCash === 156300);
   check("counted passthrough", r.counted === 156000);
   check("overShort = counted − expected (short → negative)", r.overShort === -300);
   check("totalSales = cash + card", r.totalSales === 146300);
   check("saleCount passthrough", r.saleCount === 12);
   check("cashier name from join", r.cashierName === "Test Cashier");
+  check("drawer events are separated by type", r.paidIn === 10000 && r.paidOut === -2000 && r.safeDrops === -5000 && r.cashRefunds === -3000);
   check("store info attached", r.store.nameEn.length > 0);
 }
 

@@ -10,8 +10,27 @@ const withSerwist = withSerwistInit({
   swSrc: "app/sw.ts",
   swDest: "public/sw.js",
   disable: process.env.NODE_ENV === "development",
+  // never reload the page when the connection comes back: it would wipe a cart
+  // in progress. The sync provider resends queued sales on its own.
+  reloadOnOnline: false,
 });
 
-const nextConfig: NextConfig = {};
+// Baseline hardening. camera and usb are needed for barcode scanning and
+// WebUSB receipt printers; everything else sensitive is switched off.
+// The Content-Security-Policy is set per request in proxy.ts (it needs a nonce);
+// see lib/security/csp.ts and docs/security.md.
+const securityHeaders = [
+  { key: "X-Content-Type-Options", value: "nosniff" },
+  { key: "X-Frame-Options", value: "DENY" },
+  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+  { key: "Permissions-Policy", value: "camera=(self), usb=(self), microphone=(), geolocation=(), payment=()" },
+  { key: "Strict-Transport-Security", value: "max-age=31536000; includeSubDomains" },
+];
+
+const nextConfig: NextConfig = {
+  async headers() {
+    return [{ source: "/:path*", headers: securityHeaders }];
+  },
+};
 
 export default withSerwist(withNextIntl(nextConfig));

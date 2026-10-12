@@ -3,6 +3,7 @@
 import { useTranslations } from "next-intl";
 import { CircleUser, LogOut } from "lucide-react";
 import { signOut } from "@/lib/actions/auth";
+import { clearOfflinePages } from "@/lib/offline/pages";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -19,8 +20,15 @@ export function UserMenu({ name, role }: { name: string; role: "admin" | "cashie
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" aria-label={t("account")}>
-          <CircleUser className="size-4" />
+        {/* a chip with who is signed in, so a shared till shows whose shift it is */}
+        <Button variant="ghost" className="h-10 gap-2 px-2" aria-label={t("account")}>
+          <span className="bg-primary/10 text-primary flex size-7 shrink-0 items-center justify-center rounded-full">
+            <CircleUser className="size-4" />
+          </span>
+          <span className="hidden max-w-36 flex-col items-start leading-tight md:flex">
+            <span className="w-full truncate text-sm font-medium">{name}</span>
+            <span className="text-muted-foreground text-xs">{t(`roles.${role}`)}</span>
+          </span>
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
@@ -29,7 +37,7 @@ export function UserMenu({ name, role }: { name: string; role: "admin" | "cashie
           <div className="text-muted-foreground text-xs">{t(`roles.${role}`)}</div>
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void signOut()}>
+        <DropdownMenuItem onSelect={() => void clearOfflinePages().then(() => signOut())}>
           <LogOut className="size-4" />
           {t("signOut")}
         </DropdownMenuItem>

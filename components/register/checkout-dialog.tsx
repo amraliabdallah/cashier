@@ -1,16 +1,25 @@
 "use client";
 
-import { useState } from "react";
-import { useLocale, useTranslations } from "next-intl";
+import { useRef, useState } from "react";
+import { useFormatter, useLocale, useTranslations } from "next-intl";
 import { toast } from "sonner";
 import { Banknote, CreditCard, Loader2 } from "lucide-react";
 import { useRouter } from "@/i18n/navigation";
+import { createManagerApproval } from "@/lib/actions/approvals";
 import { createSale } from "@/lib/actions/sales";
-import { formatEgp, parseEgpToPiasters, piastersToEgpInput } from "@/lib/money";
-import { useCart, toSaleItems, type CartTotals } from "@/lib/store/cart";
+import { approvalRequestHash } from "@/lib/approvals/hash";
+import { useOnline } from "@/hooks/use-online";
+import { getOfflineDb } from "@/lib/offline/db";
+import { catalogFreshness, catalogRefreshedAt, loadDiscountThreshold } from "@/lib/offline/catalog";
+import { enqueueSale } from "@/lib/offline/outbox";
+import type { OutboxEntry } from "@/lib/offline/types";
+import { buildProvisionalReceipt, discountNeedsApproval } from "@/lib/offline/provisional";
+import { formatEgp, isTenderedTooLarge, parseEgpToPiasters, piastersToEgpInput } from "@/lib/money";
+import { isValidPaymentReference } from "@/lib/payments/providers";
+import { useCart, toSaleItems, toQueuedSaleItems, type CartTotals } from "@/lib/store/cart";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
+import { Numpad, type NumpadKey } from "@/components/ui/numpad";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
@@ -20,60 +29,167 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
-// EGP notes a cashier reaches for
-const QUICK_NOTES = [5000, 10000, 20000] as const; // piasters: 50, 100, 200
+// EGP notes a cashier reaches for (piasters: 50, 100, 200, 500, 1000); only those that cover the total are shown
+const QUICK_NOTES = [5000, 10000, 20000, 50000, 100000] as const;
 
 export function CheckoutDialog({
   open,
   onOpenChange,
   totals,
+  userId,
+  shiftId,
+  cashierName,
+  onQueued,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   totals: CartTotals;
+  userId: string;
+  shiftId: string;
+  cashierName: string | null;
+  /** called with the queued sale when it was rung offline (lets the register show its receipt in place) */
+  onQueued?: (entry: OutboxEntry) => void;
 }) {
   const t = useTranslations("register.checkoutDialog");
   const tErrors = useTranslations("errors");
   const locale = useLocale();
+  const format = useFormatter();
   const router = useRouter();
   const clearCart = useCart((s) => s.clear);
+  const online = useOnline();
+  const customer = useCart((state) => state.customer);
+  const promoCodes = useCart((state) => state.promoCodes);
 
-  const [method, setMethod] = useState<"cash" | "card">("cash");
+  const [chosenMethod, setChosenMethod] = useState<"cash" | "card">("cash");
   const [tenderedInput, setTenderedInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [managerPin, setManagerPin] = useState("");
+  const [cardReference, setCardReference] = useState("");
+  // One idempotency key per checkout attempt: a retry (or the offline queue
+  // taking over after a lost response) can never create a second sale.
+  const saleKeyRef = useRef<string | null>(null);
+
+  // Card payments cannot be confirmed without the network: offline is cash only.
+  const method = online ? chosenMethod : "cash";
+
+  function resetForm() {
+    setChosenMethod("cash");
+    setTenderedInput("");
+    setManagerPin("");
+    setCardReference("");
+    saleKeyRef.current = null;
+  }
 
   // reset on close so the next checkout starts fresh
   function handleOpenChange(next: boolean) {
     if (submitting) return;
-    if (!next) {
-      setMethod("cash");
-      setTenderedInput("");
-    }
+    if (!next) resetForm();
     onOpenChange(next);
   }
 
+  /** On-screen keypad edits the same text the cashier can type. */
+  function onNumpadKey(key: NumpadKey) {
+    setTenderedInput((current) =>
+      key === "backspace" ? current.slice(0, -1) : key === "." && current.includes(".") ? current : current + key
+    );
+  }
+
+  const quickNotes = QUICK_NOTES.filter((note) => note >= totals.total);
   const tendered = parseEgpToPiasters(tenderedInput);
   const change = tendered !== null ? tendered - totals.total : null;
-  const cashInvalid = method === "cash" && (tendered === null || tendered < totals.total);
+  const tenderedTooLarge = isTenderedTooLarge(tenderedInput);
+  const cashInvalid = method === "cash" && (tendered === null || tendered < totals.total || tenderedTooLarge);
+  // a card sale is only recorded with the terminal's approval code
+  const cardInvalid = method === "card" && !isValidPaymentReference(cardReference.trim());
+
+  /** Records a cash sale in the local outbox and prints a provisional receipt. */
+  async function queueOffline(key: string): Promise<void> {
+    if (tendered === null) return;
+    const db = getOfflineDb();
+    // Prices cached more than 3 days ago (or never) are too old to sell from.
+    if (catalogFreshness(await catalogRefreshedAt(db)) === "expired") {
+      toast.error(t("offlineCatalogExpired"));
+      return;
+    }
+    // Large discounts need a live manager approval, which needs the server.
+    if (discountNeedsApproval(totals, await loadDiscountThreshold(db))) {
+      toast.error(t("offlineDiscountBlocked"));
+      return;
+    }
+    const entry = await enqueueSale(db, {
+      id: key,
+      userId,
+      shiftId,
+      items: toQueuedSaleItems(totals),
+      amountTendered: tendered,
+      customerId: customer?.id ?? null,
+      provisional: buildProvisionalReceipt(totals, tendered, cashierName),
+    });
+    clearCart();
+    toast.success(t("queuedDone", { number: entry.localNumber }));
+    resetForm();
+    onOpenChange(false);
+    // show the receipt right here: a server page that was never loaded cannot open offline
+    if (onQueued) onQueued(entry);
+    else router.push(`/offline-sales/${entry.id}?new=1`);
+  }
 
   async function confirm() {
     if (submitting || totals.lines.length === 0) return;
-    if (method === "cash" && cashInvalid) return;
+    if ((method === "cash" && cashInvalid) || (method === "card" && cardInvalid)) return;
     setSubmitting(true);
     try {
-      const result = await createSale({
+      const key = (saleKeyRef.current ??= crypto.randomUUID());
+
+      if (!online) {
+        await queueOffline(key);
+        return;
+      }
+
+      const payload = {
         items: toSaleItems(totals),
         payment_method: method,
         amount_tendered: method === "cash" ? tendered : null,
-      });
+        idempotencyKey: key,
+        shiftId,
+        cardReference: method === "card" ? cardReference.trim() : undefined,
+        customerId: customer?.id,
+        promotionCodes: promoCodes.length ? promoCodes : undefined,
+        // the total the customer was shown; the server refuses if rules moved meanwhile
+        expectedTotal: totals.total,
+      };
+      let result;
+      try {
+        result = await createSale(payload);
+        if (!result.ok && result.error === "managerApprovalRequired" && /^\d{4}$/.test(managerPin)) {
+          // Large discounts need a one-time manager approval bound to these amounts.
+          const requestHash = await approvalRequestHash(
+            `sale_discount|${totals.baseTotal}|${totals.manualDiscountTotal}`
+          );
+          const approval = await createManagerApproval({ action: "sale_discount", requestHash, pin: managerPin });
+          if (!approval.ok) {
+            toast.error(tErrors(approval.error));
+            return;
+          }
+          result = await createSale({ ...payload, approvalId: approval.data.approvalId });
+        }
+      } catch {
+        // The connection dropped mid-request, so the sale may or may not be
+        // recorded. Cash falls back to the queue under the SAME key (the
+        // server replays instead of duplicating); a card sale cannot be
+        // confirmed, so the cashier must verify it before retrying.
+        if (method === "cash") await queueOffline(key);
+        else toast.error(tErrors("cardUnconfirmed"));
+        return;
+      }
       if (!result.ok) {
+        if (result.error === "totalChanged") useCart.getState().setPromo(null); // re-evaluate before retrying
         toast.error(tErrors(result.error));
         return; // cart stays intact — fix and retry
       }
       clearCart();
       toast.success(t("saleDone", { number: result.data.saleNumber }));
-      setMethod("cash");
-      setTenderedInput("");
+      resetForm();
       onOpenChange(false);
       router.push(`/receipts/${result.data.saleId}?new=1`);
     } finally {
@@ -83,90 +199,144 @@ export function CheckoutDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{t("title")}</DialogTitle>
         </DialogHeader>
 
-        <div className="flex items-baseline justify-between">
-          <span className="text-muted-foreground">{t("amountDue")}</span>
-          <span className="text-3xl font-bold tabular-nums" dir="ltr">
+        <div className="bg-muted/60 flex flex-col items-center gap-1 rounded-xl px-4 py-3">
+          <span className="text-muted-foreground text-sm">{t("amountDue")}</span>
+          <span className="text-4xl font-bold tabular-nums sm:text-5xl" dir="ltr">
             {formatEgp(totals.total, locale)}
           </span>
         </div>
 
-        <Tabs value={method} onValueChange={(v) => setMethod(v as "cash" | "card")}>
-          <TabsList className="w-full">
-            <TabsTrigger value="cash" className="flex-1 gap-2">
-              <Banknote className="size-4" />
+        {!online && (
+          <p className="rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
+            {t("offlineNotice")}
+          </p>
+        )}
+
+        <Tabs value={method} onValueChange={(v) => setChosenMethod(v as "cash" | "card")}>
+          <TabsList className="h-12 w-full">
+            <TabsTrigger value="cash" className="flex-1 gap-2 text-base">
+              <Banknote className="size-5" />
               {t("cash")}
             </TabsTrigger>
-            <TabsTrigger value="card" className="flex-1 gap-2">
-              <CreditCard className="size-4" />
+            <TabsTrigger value="card" className="flex-1 gap-2 text-base" disabled={!online}>
+              <CreditCard className="size-5" />
               {t("card")}
             </TabsTrigger>
           </TabsList>
         </Tabs>
 
         {method === "cash" ? (
-          <div className="flex flex-col gap-3">
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                className="flex-1"
-                onClick={() => setTenderedInput(piastersToEgpInput(totals.total))}
-              >
-                {t("exact")}
-              </Button>
-              {QUICK_NOTES.map((note) => (
+          <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_15rem]">
+            <div className="flex flex-col gap-3">
+              <div className="grid grid-cols-3 gap-2">
                 <Button
-                  key={note}
                   variant="outline"
-                  size="sm"
-                  className="flex-1 tabular-nums"
-                  onClick={() => setTenderedInput(piastersToEgpInput(note))}
+                  size="lg"
+                  className="col-span-3 sm:col-span-1"
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => setTenderedInput(piastersToEgpInput(totals.total))}
                 >
-                  {note / 100}
+                  {t("exact")}
                 </Button>
-              ))}
-            </div>
-            <Input
-              dir="ltr"
-              inputMode="decimal"
-              autoFocus
-              value={tenderedInput}
-              onChange={(e) => setTenderedInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && confirm()}
-              placeholder={t("tenderedPlaceholder")}
-              className="h-12 text-center text-xl tabular-nums"
-              aria-label={t("tendered")}
-            />
-            <Separator />
-            <div className="flex items-baseline justify-between">
-              <span className="text-muted-foreground">{t("change")}</span>
-              <span
-                className={
-                  "text-2xl font-semibold tabular-nums " +
-                  (change !== null && change < 0
-                    ? "text-destructive"
-                    : "text-green-600 dark:text-green-500")
-                }
+                {quickNotes.map((note) => (
+                  <Button
+                    key={note}
+                    variant="outline"
+                    size="lg"
+                    className="text-base tabular-nums"
+                    onPointerDown={(e) => e.preventDefault()}
+                    onClick={() => setTenderedInput(piastersToEgpInput(note))}
+                  >
+                    {format.number(note / 100)}
+                  </Button>
+                ))}
+              </div>
+              <Input
                 dir="ltr"
+                inputMode="decimal"
+                autoFocus
+                value={tenderedInput}
+                onChange={(e) => setTenderedInput(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && confirm()}
+                placeholder={t("tenderedPlaceholder")}
+                className="h-14 text-center text-2xl tabular-nums"
+                aria-label={t("tendered")}
+              />
+              {tenderedTooLarge && (
+                <p className="text-destructive text-sm" role="alert">
+                  {t("tenderedTooLarge")}
+                </p>
+              )}
+              <div
+                className={
+                  "flex flex-col items-center gap-1 rounded-xl px-4 py-3 " +
+                  (change !== null && change < 0 ? "bg-destructive/10" : "bg-green-600/10")
+                }
               >
-                {change === null ? "—" : formatEgp(change, locale)}
-              </span>
+                <span className="text-muted-foreground text-sm">{t("change")}</span>
+                <span
+                  className={
+                    "text-4xl font-bold tabular-nums " +
+                    (change !== null && change < 0 ? "text-destructive" : "text-green-700 dark:text-green-500")
+                  }
+                  dir="ltr"
+                  data-testid="checkout-change"
+                >
+                  {change === null ? "—" : formatEgp(change, locale)}
+                </span>
+              </div>
             </div>
+            {/* touch: tap the amount; the typed box keeps focus for keyboards */}
+            <Numpad onKey={onNumpadKey} className="content-start" />
           </div>
         ) : (
-          <p className="text-muted-foreground py-2 text-sm">{t("cardHint")}</p>
+          <div className="flex flex-col gap-2">
+            <p className="text-muted-foreground text-sm">{t("cardHint")}</p>
+            <Input
+              dir="ltr"
+              autoFocus
+              value={cardReference}
+              onChange={(e) => setCardReference(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && confirm()}
+              placeholder={t("cardReference")}
+              aria-label={t("cardReference")}
+              aria-invalid={cardReference !== "" && cardInvalid}
+              className="h-14 text-center text-xl tabular-nums"
+            />
+            <p className="text-muted-foreground text-xs">{t("cardReferenceHint")}</p>
+          </div>
+        )}
+
+        {totals.manualDiscountTotal > 0 && (
+          <Input
+            dir="ltr"
+            type="password"
+            inputMode="numeric"
+            maxLength={4}
+            value={managerPin}
+            onChange={(e) => setManagerPin(e.target.value.replace(/\D/g, ""))}
+            onKeyDown={(e) => e.key === "Enter" && confirm()}
+            placeholder={t("managerPinOptional")}
+            aria-label={t("managerPinOptional")}
+          />
         )}
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
+          <Button variant="outline" size="xl" onClick={() => onOpenChange(false)} disabled={submitting}>
             {t("cancel")}
           </Button>
-          <Button onClick={confirm} disabled={submitting || cashInvalid} className="min-w-32">
+          <Button
+            size="xl"
+            onClick={confirm}
+            disabled={submitting || cashInvalid || cardInvalid}
+            className="min-w-48 text-lg"
+            data-testid="checkout-confirm"
+          >
             {submitting && <Loader2 className="size-4 animate-spin" />}
             {t("confirm")}
           </Button>

@@ -60,7 +60,17 @@ async function main() {
   await sell(JSON.stringify([{ product_id: PROD_B, qty: 5 }]), "50000"); // total 25000
   // Expected: revenue 59200, count 3; A qty 3 rev 34200; B qty 5 rev 25000
 
+  // `create_sale` intentionally stamps facts with now(); pin test-only data
+  // to the fixed report window so this suite is independent of the clock.
   await asAdminService(db);
+  await db.exec(`
+    set session_replication_role = replica;
+    update public.sales
+    set created_at = '2026-07-10T10:00:00Z'
+    where shift_id = '${SHIFT}';
+    set session_replication_role = origin;
+  `);
+
   await asUser(db, ADMIN);
   const call = async (sql: string) => (await db.query(sql, [FROM, TO])).rows as Record<string, unknown>[];
 
@@ -68,6 +78,8 @@ async function main() {
   {
     const [r] = await call(`select * from public.report_summary($1, $2)`);
     check("summary revenue = 59200", n(r.revenue) === 59200, String(r.revenue));
+    check("summary refunds = 0", n(r.refunds) === 0, String(r.refunds));
+    check("summary net_revenue = 59200", n(r.net_revenue) === 59200, String(r.net_revenue));
     check("summary sale_count = 3", n(r.sale_count) === 3, String(r.sale_count));
     check("summary avg_basket = 19733", n(r.avg_basket) === 19733, String(r.avg_basket));
   }

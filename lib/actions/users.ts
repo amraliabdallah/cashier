@@ -3,12 +3,15 @@
 import { revalidatePath } from "next/cache";
 import { routing } from "@/i18n/routing";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { log } from "@/lib/observability/log";
+import { createClient } from "@/lib/supabase/server";
 import { getCurrentProfile } from "@/lib/supabase/queries/profiles";
 import {
   createStaffSchema,
   setStaffPinSchema,
   setStaffRoleSchema,
   toggleStaffActiveSchema,
+  setStaffCapabilitiesSchema,
 } from "@/lib/validation/user";
 import type { ActionResult } from "./result";
 
@@ -113,6 +116,38 @@ export async function toggleStaffActive(input: unknown): Promise<ActionResult<vo
     .eq("id", parsed.data.userId);
   if (error) return { ok: false, error: "unknown" };
 
+  // `profiles.active` is enforced by RLS and the RPCs, but a deactivated user
+  // keeps a valid login token until it expires. Ban the auth account too (and
+  // lift the ban on reactivation) so the session really ends.
+  const { error: banError } = await admin.auth.admin.updateUserById(parsed.data.userId, {
+    ban_duration: parsed.data.active ? "none" : "876000h",
+  });
+  if (banError) {
+    log.error("staff_ban_failed", { userId: parsed.data.userId, reason: banError.message });
+    // roll the flag back: half-deactivated is worse than not deactivated
+    await admin.from("profiles").update({ active: !parsed.data.active }).eq("id", parsed.data.userId);
+    return { ok: false, error: "unknown" };
+  }
+
+  revalidateUsers();
+  return { ok: true, data: undefined };
+}
+
+/** Replaces explicit grants through one audited RPC; admins inherit all capabilities and need no rows. */
+export async function setStaffCapabilities(input: unknown): Promise<ActionResult<void>> {
+  const adminId = await currentAdminId();
+  if (!adminId) return { ok: false, error: "notAuthorized" };
+  const parsed = setStaffCapabilitiesSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, error: "invalidInput" };
+  const supabase = await createClient();
+  const { error } = await supabase.rpc("set_staff_capabilities", {
+    p_staff_id: parsed.data.userId,
+    p_capabilities: parsed.data.capabilities,
+  });
+  if (error) {
+    if (error.message.includes("your own")) return { ok: false, error: "cannotEditSelf" };
+    return { ok: false, error: error.message.includes("admin only") ? "notAuthorized" : "unknown" };
+  }
   revalidateUsers();
   return { ok: true, data: undefined };
 }

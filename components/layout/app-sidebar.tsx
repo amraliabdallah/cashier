@@ -1,16 +1,7 @@
 "use client";
 
-import { useLocale, useTranslations } from "next-intl";
-import {
-  ShoppingCart,
-  Package,
-  Tags,
-  BarChart3,
-  Clock,
-  Store,
-  ReceiptText,
-  UsersRound,
-} from "lucide-react";
+import { useFormatter, useLocale, useTranslations } from "next-intl";
+import { Store } from "lucide-react";
 import { Link, usePathname } from "@/i18n/navigation";
 import { getDirection, type Locale } from "@/i18n/routing";
 import {
@@ -18,23 +9,33 @@ import {
   SidebarContent,
   SidebarGroup,
   SidebarGroupContent,
+  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
+import { useOutboxCounts } from "@/hooks/use-outbox-counts";
+import { useOnline } from "@/hooks/use-online";
+import { OFFLINE_CAPABLE } from "@/lib/offline/pages";
+import { toast } from "sonner";
+import { CloudOff } from "lucide-react";
+import { matchNav, navGroupsFor } from "./nav-items";
 
-const navItems = [
-  { key: "register", href: "/register", icon: ShoppingCart, adminOnly: false },
-  { key: "sales", href: "/receipts", icon: ReceiptText, adminOnly: false },
-  { key: "shifts", href: "/shifts", icon: Clock, adminOnly: false },
-  { key: "products", href: "/products", icon: Package, adminOnly: true },
-  { key: "categories", href: "/categories", icon: Tags, adminOnly: true },
-  { key: "reports", href: "/reports", icon: BarChart3, adminOnly: true },
-  { key: "users", href: "/users", icon: UsersRound, adminOnly: true },
-] as const;
+// accent bar on the active entry; taller rows for touch
+const ITEM_CLASS =
+  "relative h-10 text-[0.9375rem] data-active:font-semibold data-active:before:absolute data-active:before:inset-y-2 data-active:before:start-0 data-active:before:w-1 data-active:before:rounded-full data-active:before:bg-sidebar-primary";
 
-export function AppSidebar({ role }: { role: "admin" | "cashier" }) {
+export function AppSidebar({
+  role,
+  storeName,
+  userId,
+}: {
+  role: "admin" | "cashier";
+  storeName?: string | null;
+  userId: string;
+}) {
   // useTranslations is a hook — the Vue next-intl equivalent would be
   // useI18n().t, but here it's scoped to a namespace at call time.
   const t = useTranslations("nav");
@@ -43,6 +44,28 @@ export function AppSidebar({ role }: { role: "admin" | "cashier" }) {
   // usePathname from i18n/navigation strips the locale prefix,
   // so "/ar/products" comes back as "/products".
   const pathname = usePathname();
+  const active = matchNav(pathname)?.item.key;
+  // sales waiting to reach the server (same live count as the header badge)
+  const format = useFormatter();
+  const counts = useOutboxCounts(userId);
+  const pending = (counts?.queued ?? 0) + (counts?.syncing ?? 0) + (counts?.rejected ?? 0);
+  const online = useOnline();
+  const tShell = useTranslations("shell");
+
+  /**
+   * Offline, only the register and pending sales can open (they are saved on
+   * the till). They are loaded as full pages so the saved copy is used; the
+   * rest would hit the server, so they say so instead of showing the
+   * browser's "unable to connect".
+   */
+  function onNavClick(event: React.MouseEvent<HTMLAnchorElement>, href: string) {
+    if (online) return;
+    event.preventDefault();
+    // a full page load on purpose: the service worker answers it from the copy saved on this till
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+    if ((OFFLINE_CAPABLE as readonly string[]).includes(href)) window.location.assign(`/${locale}${href}`);
+    else toast.error(tShell("needsConnection"));
+  }
 
   return (
     <Sidebar side={getDirection(locale) === "rtl" ? "right" : "left"} collapsible="icon">
@@ -51,38 +74,49 @@ export function AppSidebar({ role }: { role: "admin" | "cashier" }) {
           <SidebarMenuItem>
             <SidebarMenuButton size="lg" asChild>
               <Link href="/">
-                <div className="bg-primary text-primary-foreground flex size-8 items-center justify-center rounded-lg">
-                  <Store className="size-4" />
+                <div className="bg-primary text-primary-foreground flex size-9 shrink-0 items-center justify-center rounded-xl shadow-xs">
+                  <Store className="size-5" />
                 </div>
-                <span className="text-base font-semibold">{tCommon("appName")}</span>
+                <div className="flex min-w-0 flex-col leading-tight">
+                  <span className="text-base font-semibold">{tCommon("appName")}</span>
+                  {storeName ? <span className="text-muted-foreground truncate text-xs">{storeName}</span> : null}
+                </div>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {navItems
-                .filter((item) => role === "admin" || !item.adminOnly)
-                .map((item) => (
-                <SidebarMenuItem key={item.key}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={pathname === item.href || pathname.startsWith(item.href + "/")}
-                    tooltip={t(item.key)}
-                  >
-                    <Link href={item.href}>
-                      <item.icon />
-                      <span>{t(item.key)}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {/* grouped so things are easy to find; cashiers only see "Sell" */}
+        {navGroupsFor(role).map((group) => (
+          <SidebarGroup key={group.key}>
+            <SidebarGroupLabel>{t(`groups.${group.key}`)}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {group.items.map((item) => (
+                  <SidebarMenuItem key={item.key}>
+                    <SidebarMenuButton asChild isActive={active === item.key} tooltip={t(item.key)} className={ITEM_CLASS}>
+                      <Link
+                        href={item.href}
+                        onClick={(event) => onNavClick(event, item.href)}
+                        className={!online && !(OFFLINE_CAPABLE as readonly string[]).includes(item.href) ? "opacity-50" : undefined}
+                      >
+                        <item.icon />
+                        <span>{t(item.key)}</span>
+                        {!online && !(OFFLINE_CAPABLE as readonly string[]).includes(item.href) && (
+                          <CloudOff className="ms-auto opacity-60" />
+                        )}
+                      </Link>
+                    </SidebarMenuButton>
+                    {item.key === "offlineSales" && pending > 0 ? (
+                      <SidebarMenuBadge className="bg-amber-500/15 top-2.5! text-amber-700 dark:text-amber-400">{format.number(pending)}</SidebarMenuBadge>
+                    ) : null}
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
       </SidebarContent>
     </Sidebar>
   );

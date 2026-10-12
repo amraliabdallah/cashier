@@ -3,6 +3,9 @@
 import { revalidatePath } from "next/cache";
 import { routing } from "@/i18n/routing";
 import { createClient } from "@/lib/supabase/server";
+import { log } from "@/lib/observability/log";
+import { recordOpsEvent } from "@/lib/ops/events";
+import { createHash } from "node:crypto";
 import { openShiftSchema, closeShiftSchema } from "@/lib/validation/shift";
 import type { ActionResult } from "./result";
 
@@ -41,12 +44,36 @@ export async function closeShift(input: unknown): Promise<ActionResult<{ shiftId
   if (!parsed.success) return { ok: false, error: "invalidInput" };
 
   const supabase = await createClient();
-  const { error } = await supabase.rpc("close_shift", {
+  let { error } = await supabase.rpc("close_shift", {
     p_shift_id: parsed.data.shiftId,
     p_counted: parsed.data.counted,
+    p_approval_id: parsed.data.approvalId ?? undefined,
   });
+  if (error?.message.includes("manager approval") && parsed.data.managerPin) {
+    const [{ data: shift }, { data: events }] = await Promise.all([
+      supabase.from("shifts").select("opening_float").eq("id", parsed.data.shiftId).single(),
+      supabase.from("cash_drawer_events").select("amount").eq("shift_id", parsed.data.shiftId),
+    ]);
+    const expected = Number(shift?.opening_float ?? 0) + (events ?? []).reduce((total, event) => total + Number(event.amount), 0);
+    const requestHash = createHash("sha256")
+      .update(`shift_close|${parsed.data.shiftId}|${parsed.data.counted}|${expected}`)
+      .digest("hex");
+    const approval = await supabase.rpc("create_manager_approval", {
+      p_action: "shift_close", p_request_hash: requestHash, p_pin: parsed.data.managerPin,
+    });
+    if (!approval.error && approval.data) {
+      ({ error } = await supabase.rpc("close_shift", {
+        p_shift_id: parsed.data.shiftId, p_counted: parsed.data.counted, p_approval_id: approval.data,
+      }));
+    }
+  }
   if (error) {
     if (error.message.includes("not your shift")) return { ok: false, error: "notAuthorized" };
+    if (error.message.includes("manager approval")) {
+      return { ok: false, error: "managerApprovalRequired" };
+    }
+    log.error("shift_close_failed", { code: error.code, message: error.message });
+    await recordOpsEvent("rpc_failed", { rpc: "close_shift", code: error.code ?? "unknown" });
     return { ok: false, error: "shiftCloseFailed" };
   }
 

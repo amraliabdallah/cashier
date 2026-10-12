@@ -1,10 +1,12 @@
 import { setRequestLocale, getTranslations, getFormatter } from "next-intl/server";
-import { ChevronLeft, ChevronRight, ReceiptText } from "lucide-react";
+import { ChevronLeft, ChevronRight, Clock, ReceiptText } from "lucide-react";
 import { Link } from "@/i18n/navigation";
 import { getActiveShift, getShifts } from "@/lib/supabase/queries/shifts";
 import { formatEgp } from "@/lib/money";
+import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import {
   Table,
   TableBody,
@@ -14,6 +16,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { CloseShiftDialog } from "@/components/shifts/close-shift-dialog";
+import { CashDrawerEventDialog } from "@/components/shifts/cash-drawer-event-dialog";
 import { OpenShiftForm } from "@/components/shifts/open-shift-form";
 
 export default async function ShiftsPage({
@@ -43,12 +46,12 @@ export default async function ShiftsPage({
 
   return (
     <div className="flex w-full flex-col gap-4">
-      <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
+      <PageHeader className="mb-0" title={t("title")} description={t("pageDescription")} />
 
       <Card>
-        <CardHeader className="flex-row items-center justify-between">
+        <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2">
           <CardTitle className="text-base">{t("current")}</CardTitle>
-          {active && <CloseShiftDialog shiftId={active.id} />}
+          {active && <div className="flex flex-wrap items-center gap-2"><CashDrawerEventDialog shiftId={active.id} /><CloseShiftDialog shiftId={active.id} /></div>}
         </CardHeader>
         <CardContent>
           {active ? (
@@ -90,8 +93,8 @@ export default async function ShiftsPage({
           <TableBody>
             {result.rows.length === 0 && (
               <TableRow>
-                <TableCell colSpan={8} className="text-muted-foreground h-24 text-center">
-                  {t("empty")}
+                <TableCell colSpan={8}>
+                  <EmptyState icon={Clock} title={t("empty")} className="py-8" />
                 </TableCell>
               </TableRow>
             )}

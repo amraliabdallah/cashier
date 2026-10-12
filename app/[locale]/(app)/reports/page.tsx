@@ -4,6 +4,7 @@ import { getDirection, type Locale } from "@/i18n/routing";
 import { Link } from "@/i18n/navigation";
 import { formatEgp } from "@/lib/money";
 import {
+  businessToday,
   defaultRange,
   getSummary,
   getSalesOverTime,
@@ -13,6 +14,10 @@ import {
   getProfit,
   type Bucket,
 } from "@/lib/supabase/queries/reports";
+import { getOpenShiftCount } from "@/lib/supabase/queries/shifts";
+import { getReorderAlerts } from "@/lib/supabase/queries/ops-reports";
+import { optionalQuery } from "@/lib/supabase/queries/optional";
+import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -25,6 +30,8 @@ import {
 } from "@/components/ui/card";
 import { TimeSeriesChart, CategoricalBarChart } from "@/components/reports/charts";
 import { ExportButton } from "@/components/reports/export-button";
+import { ReportsNav } from "@/components/reports/reports-nav";
+import { Clock, PackageMinus, ReceiptText, ShoppingBasket, type LucideIcon } from "lucide-react";
 
 type SearchParams = { from?: string; to?: string; bucket?: string };
 
@@ -45,7 +52,7 @@ export default async function ReportsPage({
   const name = (ar: string | null, en: string | null) => (isAr ? ar : en) ?? en ?? ar ?? "—";
 
   const sp = await searchParams;
-  const fallback = defaultRange();
+  const fallback = await defaultRange();
   const from = sp.from || fallback.from;
   const to = sp.to || fallback.to;
   const bucket: Bucket = sp.bucket === "week" || sp.bucket === "month" ? sp.bucket : "day";
@@ -54,10 +61,19 @@ export default async function ReportsPage({
 
   const bucketLabel = (iso: string) => {
     const d = new Date(iso);
+    // bucket_start is a business DATE stored at 00:00 UTC, so format it in UTC
     return bucket === "month"
-      ? format.dateTime(d, { year: "numeric", month: "short" })
-      : format.dateTime(d, { day: "2-digit", month: "short" });
+      ? format.dateTime(d, { year: "numeric", month: "short", timeZone: "UTC" })
+      : format.dateTime(d, { day: "2-digit", month: "short", timeZone: "UTC" });
   };
+
+  // today at a glance: each tile degrades to "—" on its own instead of breaking the page
+  const today = await businessToday();
+  const [todaySummary, openShifts, lowStock] = await Promise.all([
+    optionalQuery("today_summary", () => getSummary({ from: today, to: today }), null),
+    optionalQuery("open_shifts", () => getOpenShiftCount(), null),
+    optionalQuery("low_stock", async () => (await getReorderAlerts()).length, null),
+  ]);
 
   // Fetch everything in parallel (SQL does the aggregation).
   const [summary, overTime, topRevenue, topQty, byCategory, byCashier, profit] = rangeValid
@@ -78,10 +94,43 @@ export default async function ReportsPage({
 
   return (
     <div className="flex w-full flex-col gap-6">
-      <div className="flex flex-col gap-1">
-        <h1 className="text-2xl font-semibold tracking-tight">{t("title")}</h1>
-        <p className="text-muted-foreground text-sm">{t("subtitle")}</p>
-      </div>
+      <PageHeader className="mb-0" title={t("title")} description={t("subtitle")} />
+
+      <section aria-labelledby="today-heading" className="flex flex-col gap-3">
+        <h2 id="today-heading" className="text-lg font-semibold">
+          {t("today.title")}
+        </h2>
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <GlanceTile
+            icon={ShoppingBasket}
+            label={t("today.sales")}
+            value={todaySummary ? formatEgp(todaySummary.netRevenue, locale) : "—"}
+            hint={todaySummary ? t("today.avgBasket", { amount: formatEgp(todaySummary.avgBasket, locale) }) : undefined}
+            href="/reports/daily"
+          />
+          <GlanceTile
+            icon={ReceiptText}
+            label={t("today.receipts")}
+            value={todaySummary ? format.number(todaySummary.saleCount) : "—"}
+            href="/receipts"
+          />
+          <GlanceTile
+            icon={Clock}
+            label={t("today.openShifts")}
+            value={openShifts === null ? "—" : format.number(openShifts)}
+            href="/shifts"
+          />
+          <GlanceTile
+            icon={PackageMinus}
+            label={t("today.lowStock")}
+            value={lowStock === null ? "—" : format.number(lowStock)}
+            tone={lowStock ? "warning" : undefined}
+            href="/stock-alerts"
+          />
+        </div>
+      </section>
+
+      <ReportsNav active="overview" />
 
       <form method="get" className="flex flex-wrap items-end gap-2">
         <label className="text-muted-foreground flex items-center gap-1 text-sm">
@@ -117,8 +166,10 @@ export default async function ReportsPage({
       ) : (
         <>
           {/* Summary cards */}
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard title={t("revenue")} value={formatEgp(summary!.revenue, locale)} />
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-5">
+            <StatCard title={t("grossSales")} value={formatEgp(summary!.revenue, locale)} />
+            <StatCard title={t("refunds")} value={`-${formatEgp(summary!.refunds, locale)}`} />
+            <StatCard title={t("netSales")} value={formatEgp(summary!.netRevenue, locale)} />
             <StatCard
               title={t("saleCount")}
               value={format.number(summary!.saleCount)}
@@ -255,7 +306,7 @@ export default async function ReportsPage({
                 />
               </CardAction>
             </CardHeader>
-            <CardContent className="grid gap-4 sm:grid-cols-4">
+            <CardContent className="grid grid-cols-2 gap-4 lg:grid-cols-4">
               <Metric label={t("netRevenue")} value={formatEgp(profit!.netRevenue, locale)} />
               <Metric label={t("cost")} value={formatEgp(profit!.cost, locale)} />
               <Metric label={t("profit")} value={formatEgp(profit!.profit, locale)} />
@@ -280,7 +331,7 @@ function StatCard({ title, value, plain }: { title: string; value: string; plain
     <Card size="sm">
       <CardHeader>
         <CardDescription>{title}</CardDescription>
-        <CardTitle className="text-2xl tabular-nums" dir={plain ? undefined : "ltr"}>
+        <CardTitle className="text-xl tabular-nums break-words sm:text-2xl" dir={plain ? undefined : "ltr"}>
           {value}
         </CardTitle>
       </CardHeader>
@@ -324,5 +375,45 @@ function ChartCard({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/** One "today" number that opens the page with the details. */
+function GlanceTile({
+  icon: Icon,
+  label,
+  value,
+  hint,
+  href,
+  tone,
+}: {
+  icon: LucideIcon;
+  label: string;
+  value: string;
+  hint?: string;
+  href: string;
+  tone?: "warning";
+}) {
+  return (
+    <Link
+      href={href}
+      className="bg-card hover:border-primary focus-visible:ring-ring flex min-w-0 flex-col gap-2 rounded-xl border p-4 transition-colors outline-none focus-visible:ring-2"
+    >
+      <span className="text-muted-foreground flex items-center gap-2 text-sm">
+        <span
+          className={
+            "flex size-8 shrink-0 items-center justify-center rounded-lg " +
+            (tone === "warning" ? "bg-amber-500/15 text-amber-700 dark:text-amber-400" : "bg-accent text-accent-foreground")
+          }
+        >
+          <Icon className="size-4" />
+        </span>
+        <span className="truncate">{label}</span>
+      </span>
+      <span className="text-2xl font-bold tabular-nums break-words" dir="ltr">
+        {value}
+      </span>
+      {hint ? <span className="text-muted-foreground text-xs">{hint}</span> : null}
+    </Link>
   );
 }

@@ -1,0 +1,125 @@
+name: Build apps
+
+# Manual: builds unsigned desktop installers and an Android debug APK that load
+# the deployed web app. Signing is configured separately (see docs/apps.md).
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: Production https URL of the web app
+        required: true
+  # a tag like desktop-v1.0.1 builds the Windows installer and publishes it to the releases repo
+  push:
+    tags: ["desktop-v*"]
+
+jobs:
+  desktop:
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Set app URL
+        shell: bash
+        run: node -e "const f='desktop/app-config.json',c=require('./'+f);c.appUrl=process.env.APP_URL;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+        env:
+          APP_URL: ${{ inputs.app_url }}
+      - run: npm install
+        working-directory: desktop
+      - run: npm run dist
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: |
+            desktop/dist/*.exe
+            desktop/dist/*.dmg
+            desktop/dist/*.AppImage
+            desktop/dist/*.deb
+
+  android:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Set app URL
+        run: node -e "const f='mobile/capacitor.config.json',c=require('./'+f);c.server.url=process.env.APP_URL;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+        env:
+          APP_URL: ${{ inputs.app_url }}
+      - run: npm install
+        working-directory: mobile
+      - run: npm run sync
+        working-directory: mobile
+      - run: ./gradlew assembleDebug
+        working-directory: mobile/android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-debug-apk
+          path: mobile/android/app/build/outputs/apk/debug/*.apk
+
+  # Publishes the Windows installer (and the update files the app downloads) to the PUBLIC releases
+  # repository named in desktop/package.json -> build.publish. Setup: docs/desktop-printing.md.
+  desktop-release:
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The tag must match the app version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#desktop-v}"
+          version="$(node -p "require('./desktop/package.json').version")"
+          if [ "$tag" != "$version" ]; then echo "tag desktop-v$tag does not match desktop/package.json version $version"; exit 1; fi
+      - name: Set the app URL
+        shell: bash
+        run: |
+          if [ -z "$APP_URL" ]; then echo "set the repository variable POS_APP_URL to the production https address"; exit 1; fi
+          node -e "const f='desktop/app-config.json',c=require('./'+f);c.appUrl=process.env.APP_URL;require('fs').writeFileSync(f,JSON.stringify(c,null,2))"
+        env:
+          APP_URL: ${{ vars.POS_APP_URL }}
+      - run: npm ci
+        working-directory: desktop
+      # GitHub can refuse to create the tag while publishing a release ("Published releases must
+      # have a valid tag"), so the tag is created in the releases repository first.
+      - name: Create the version tag in the releases repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "add the secret RELEASES_REPO_TOKEN (see docs/desktop-printing.md)"; exit 1; fi
+          version="$(node -p "require('./desktop/package.json').version")"
+          target="$(node -p "const p=[].concat(require('./desktop/package.json').build.publish).find((x) => x.provider === 'github'); p.owner + '/' + p.repo")"
+          if gh api "repos/$target/git/ref/tags/v$version" > /dev/null 2>&1; then
+            echo "tag v$version already exists in $target"
+          else
+            sha="$(gh api "repos/$target/commits/HEAD" --jq .sha)" || { echo "cannot read $target: the token needs access to that repository"; exit 1; }
+            gh api -X POST "repos/$target/git/refs" -f "ref=refs/tags/v$version" -f "sha=$sha" > /dev/null \
+              || { echo "cannot create tag v$version in $target: the token needs Contents: Read and write"; exit 1; }
+            echo "created tag v$version in $target"
+          fi
+      - name: Build and publish
+        run: npm run release:win
+        working-directory: desktop
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          # unsigned unless a certificate is provided (see docs/apps.md)
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.CSC_LINK == '' && 'false' || 'true' }}

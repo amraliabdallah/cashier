@@ -5,6 +5,13 @@ const ARABIC_INDIC_ZERO = 0x0660; // ٠
 const EXTENDED_ARABIC_INDIC_ZERO = 0x06f0; // ۰
 
 /** Normalize Arabic-Indic digits (٠١٢٣ / ۰۱۲۳) and separators (٫ ,) to ASCII. */
+/**
+ * Largest cash amount a till accepts as "received" (EGP 100,000, in piasters).
+ * A scanned 13-digit barcode typed into the tendered box is far above this, so
+ * it can never be confirmed as a payment.
+ */
+export const MAX_TENDERED_PIASTERS = 10_000_000;
+
 export function normalizeDigits(input: string): string {
   let out = "";
   for (const ch of input) {
@@ -35,6 +42,16 @@ export function parseEgpToPiasters(input: string): number | null {
   return pounds * 100 + piasters;
 }
 
+/**
+ * True when a typed "cash received" amount is above the cap, including input
+ * too long to parse at all (a 13-digit barcode read into the box).
+ */
+export function isTenderedTooLarge(input: string): boolean {
+  const parsed = parseEgpToPiasters(input);
+  if (parsed !== null) return parsed > MAX_TENDERED_PIASTERS;
+  return /^\d{11,}(?:\.\d*)?$/.test(normalizeDigits(input.trim()));
+}
+
 /** Integer piasters → plain input string ("4895" → "48.95", "4800" → "48"). */
 export function piastersToEgpInput(piasters: number): string {
   const sign = piasters < 0 ? "-" : "";
@@ -45,11 +62,17 @@ export function piastersToEgpInput(piasters: number): string {
 }
 
 /** Localized currency display. Division is display-only (Intl rounds to 2dp). */
+// building an Intl.NumberFormat is slow; the register formats hundreds of prices per render
+const egpFormats = new Map<string, Intl.NumberFormat>();
+
 export function formatEgp(piasters: number, locale: string): string {
-  return new Intl.NumberFormat(locale === "ar" ? "ar-EG" : "en-EG", {
-    style: "currency",
-    currency: "EGP",
-  }).format(piasters / 100);
+  const tag = locale === "ar" ? "ar-EG" : "en-EG";
+  let format = egpFormats.get(tag);
+  if (!format) {
+    format = new Intl.NumberFormat(tag, { style: "currency", currency: "EGP" });
+    egpFormats.set(tag, format);
+  }
+  return format.format(piasters / 100);
 }
 
 /**

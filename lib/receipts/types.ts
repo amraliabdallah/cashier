@@ -14,8 +14,11 @@ export type StoreInfo = {
   addressAr: string;
   addressEn: string;
   phone: string;
-  /** Egyptian tax registration number — printed on every receipt. */
+  /** Egyptian tax registration number — printed on every receipt when set. */
   taxId: string;
+  /** Optional closing line, e.g. a thank-you or return policy. */
+  footerAr: string;
+  footerEn: string;
 };
 
 export type ReceiptLine = {
@@ -51,4 +54,6 @@ export type ReceiptData = {
   changeDue: number | null;
   /** encoded in the receipt's QR code */
   qrValue: string;
+  /** Set for a sale rung offline and not yet numbered by the server (e.g. "P-3"). */
+  provisionalLabel?: string;
 };
